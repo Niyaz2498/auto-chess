@@ -1,0 +1,7 @@
+opencv-contrib-python>=4.8.0
+python-chess>=1.10.0
+PyQt5>=5.15.0
+numpy>=1.24.0
+Pillow>=10.0.0
+stockfish>=3.28.0
+pyobjc-framework-GameController>=10.0

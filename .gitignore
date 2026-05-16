@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+env/
+venv/
+.venv/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Claude Code project data
+.claude/
+
+# User-specific calibration (generated at runtime, machine-specific)
+chess_vision/calibration/calibration_data.json
+
+# Saved games (user data, not source code)
+chess_vision/games/*.pgn
