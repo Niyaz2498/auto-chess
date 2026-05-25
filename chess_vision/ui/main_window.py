@@ -7,10 +7,10 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
     QLabel, QSlider, QComboBox, QCheckBox, QTextEdit, QDialog,
     QDialogButtonBox, QMessageBox, QSizePolicy, QFrame, QGroupBox, QSpinBox,
-    QAbstractButton, QApplication,
+    QAbstractButton, QApplication, QShortcut,
 )
 from PyQt5.QtCore import Qt, QTimer, QObject, QEvent, pyqtSlot
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QKeySequence
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -105,6 +105,22 @@ def _san_to_speech(san: str) -> str:
     return _P.join(parts) + promo_suffix + suffix
 
 
+def _engine_sq_names(board: chess.Board, move: chess.Move) -> set:
+    """Square names whose piece occupancy changes as a result of move.
+    Handles castling (4 squares) and en passant (3 squares)."""
+    sqs = {chess.square_name(move.from_square), chess.square_name(move.to_square)}
+    if board.is_en_passant(move):
+        ep = chess.square(chess.square_file(move.to_square), chess.square_rank(move.from_square))
+        sqs.add(chess.square_name(ep))
+    if board.is_castling(move):
+        rank = chess.square_rank(move.from_square)
+        if chess.square_file(move.to_square) == 6:  # kingside
+            sqs |= {chess.square_name(chess.square(7, rank)), chess.square_name(chess.square(5, rank))}
+        else:                                        # queenside
+            sqs |= {chess.square_name(chess.square(0, rank)), chess.square_name(chess.square(3, rank))}
+    return sqs
+
+
 class MouseFilter(QObject):
     """App-level event filter: left click → My Move, right click → Confirm Engine Move."""
 
@@ -160,6 +176,7 @@ class MainWindow(QMainWindow):
         self._level         = DEFAULT_LEVEL
         self._game_active   = False
         self._awaiting_engine_confirm = False
+        self._engine_move_squares: set = set()   # squares the engine move touches
         self._last_player_move:  chess.Move | None = None
         self._last_engine_move:  chess.Move | None = None
         self._pending_promotion: list[str] | None  = None
@@ -216,7 +233,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._lighting_banner)
 
         # Buttons
-        self._btn_my_move = QPushButton("My Move ✓  [Back]")
+        self._btn_my_move = QPushButton("My Move  [Space]")
         self._btn_my_move.setMinimumHeight(48)
         self._btn_my_move.setFont(QFont("", 14, QFont.Bold))
         self._btn_my_move.setStyleSheet(
@@ -224,21 +241,20 @@ class MainWindow(QMainWindow):
             "QPushButton:hover { background:#2ecc71; }"
             "QPushButton:disabled { background:#555; }"
         )
-        self._btn_my_move.clicked.connect(self._on_my_move)
+        self._btn_my_move.clicked.connect(self._on_space)
         self._btn_my_move.setEnabled(False)
         layout.addWidget(self._btn_my_move)
 
-        self._btn_confirm_engine = QPushButton("Confirm Engine Move ✓  [Forward]")
-        self._btn_confirm_engine.setMinimumHeight(40)
-        self._btn_confirm_engine.setStyleSheet(
-            "QPushButton { background:#2980b9; color:white; border-radius:6px; }"
-            "QPushButton:hover { background:#3498db; }"
-            "QPushButton:disabled { background:#555; }"
+        self._btn_set_baseline = QPushButton("Set Baseline (piece touched)")
+        self._btn_set_baseline.setMinimumHeight(32)
+        self._btn_set_baseline.setStyleSheet(
+            "QPushButton { background:#7f8c8d; color:white; border-radius:6px; font-size:12px; }"
+            "QPushButton:hover { background:#95a5a6; }"
+            "QPushButton:disabled { background:#444; }"
         )
-        self._btn_confirm_engine.clicked.connect(self._on_confirm_engine)
-        self._btn_confirm_engine.setEnabled(False)
-        self._btn_confirm_engine.setVisible(False)
-        layout.addWidget(self._btn_confirm_engine)
+        self._btn_set_baseline.clicked.connect(self._on_set_baseline)
+        self._btn_set_baseline.setEnabled(False)
+        layout.addWidget(self._btn_set_baseline)
 
         # Calibrate + heatmap row
         row = QHBoxLayout()
@@ -441,8 +457,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Stockfish Not Found", str(e))
 
     def _init_mouse_filter(self) -> None:
-        self._mouse_filter = MouseFilter(self._on_my_move, self._on_confirm_engine, self)
-        QApplication.instance().installEventFilter(self._mouse_filter)
+        sc = QShortcut(QKeySequence(Qt.Key_Space), self)
+        sc.setContext(Qt.ApplicationShortcut)
+        sc.activated.connect(self._on_space)
 
     def _start_camera_timer(self) -> None:
         self._cam_timer = QTimer(self)
@@ -570,8 +587,7 @@ class MainWindow(QMainWindow):
         self._level_combo.setEnabled(False)
         self._color_combo.setEnabled(False)
         self._btn_resign.setEnabled(True)
-        self._btn_confirm_engine.setVisible(False)
-        self._btn_confirm_engine.setEnabled(False)
+        self._btn_set_baseline.setEnabled(True)
 
         self._board_widget.update_board(self._game_manager.get_board())
         self._update_move_history()
@@ -596,16 +612,29 @@ class MainWindow(QMainWindow):
         self._update_game_status()
 
     @pyqtSlot()
-    def _on_my_move(self) -> None:
-        if not self._game_active or self._awaiting_engine_confirm:
+    def _on_space(self) -> None:
+        if not self._game_active:
             return
 
+        # ── State 2: confirm engine move was placed on physical board ──────────
+        if self._awaiting_engine_confirm:
+            frame = self._camera.read_frame(flush=True)
+            if frame is not None and self._calibrator.is_calibrated():
+                warped = self._calibrator.warp_frame(frame)
+                self._detector.confirm_position(warped)
+            self._awaiting_engine_confirm = False
+            self._engine_move_squares = set()
+            subprocess.Popen(["afplay", "/System/Library/Sounds/Tink.aiff"])
+            self._set_status("Your turn. Make your move, then press Space.")
+            return
+
+        # ── State 1: detect and resolve player's move ─────────────────────────
         frame = self._camera.read_frame(flush=True)
         if frame is None:
             self._set_status("No camera frame — try again.")
             return
 
-        warped  = self._calibrator.warp_frame(frame)
+        warped = self._calibrator.warp_frame(frame)
         try:
             changed = self._detector.detect_changed_squares(warped)
         except RuntimeError as e:
@@ -613,10 +642,9 @@ class MainWindow(QMainWindow):
             return
 
         if not changed:
-            self._set_status("No change detected. Remove hand and press again.")
+            self._set_status("No change detected — make your move then press Space.")
             return
 
-        # Check for promotion before resolving
         promotion = None
         if self._pending_promotion:
             changed   = self._pending_promotion
@@ -630,7 +658,6 @@ class MainWindow(QMainWindow):
             self._set_status(f"Move error: {e}")
             return
 
-        # Need promotion selection?
         if self._game_manager.needs_promotion(move.from_square, move.to_square) and promotion is None:
             self._pending_promotion = changed
             promotion = self._ask_promotion()
@@ -669,8 +696,10 @@ class MainWindow(QMainWindow):
             self._set_status(f"Engine error: {e}")
             return
 
+        board_before          = self._game_manager.get_board().copy()
         self._last_engine_move = engine_move
-        engine_san = self._game_manager.get_board().san(engine_move)
+        engine_san            = board_before.san(engine_move)
+        self._engine_move_squares = _engine_sq_names(board_before, engine_move)
         self._game_manager.push_move(engine_move)
         self._board_widget.update_board(
             self._game_manager.get_board(),
@@ -683,30 +712,28 @@ class MainWindow(QMainWindow):
         from_name = chess.square_name(engine_move.from_square)
         to_name   = chess.square_name(engine_move.to_square)
         self._set_status(
-            f"Engine played {from_name}→{to_name}. "
-            "Make that move on the physical board, then press Confirm Engine Move."
+            f"Engine: {engine_san} ({from_name}→{to_name}). "
+            "Place it on the board, then press Space."
         )
         _say(_san_to_speech(engine_san), voice=self._voice_combo.currentData())
 
         self._awaiting_engine_confirm = True
-        self._btn_confirm_engine.setVisible(True)
-        self._btn_confirm_engine.setEnabled(True)
+        self._btn_my_move.setEnabled(True)
 
         if self._game_manager.is_game_over():
             self._end_game()
 
     @pyqtSlot()
-    def _on_confirm_engine(self) -> None:
+    def _on_set_baseline(self) -> None:
+        """Re-snap baseline from the current camera frame (use after accidentally touching a piece)."""
         frame = self._camera.read_frame(flush=True)
-        if frame is not None and self._calibrator.is_calibrated():
-            warped = self._calibrator.warp_frame(frame)
-            self._detector.confirm_position(warped)
-
-        self._awaiting_engine_confirm = False
-        self._btn_confirm_engine.setVisible(False)
-        self._btn_confirm_engine.setEnabled(False)
-        self._btn_my_move.setEnabled(True)
-        self._set_status("Your turn. Make your move, then press My Move.")
+        if frame is None or not self._calibrator.is_calibrated():
+            self._set_status("Cannot set baseline — no camera frame.")
+            return
+        warped = self._calibrator.warp_frame(frame)
+        self._detector.confirm_position(warped)
+        subprocess.Popen(["afplay", "/System/Library/Sounds/Tink.aiff"])
+        self._set_status("Baseline updated. Continue playing.")
 
     @pyqtSlot()
     def _on_resign(self) -> None:
@@ -718,7 +745,7 @@ class MainWindow(QMainWindow):
     def _end_game(self, resigned: bool = False) -> None:
         self._game_active = False
         self._btn_my_move.setEnabled(False)
-        self._btn_confirm_engine.setVisible(False)
+        self._btn_set_baseline.setEnabled(False)
         self._btn_resign.setEnabled(False)
         self._level_combo.setEnabled(True)
         self._color_combo.setEnabled(True)
